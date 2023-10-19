@@ -7,7 +7,7 @@ from typing import List
 
 from mistral.rope import precompute_freqs_cis, apply_rotary_emb
 from mistral.cache import CacheView, RotatingBufferCache
-
+from operator import itemgetter
 from xformers.ops.fmha import (
     memory_efficient_attention,
 )
@@ -41,11 +41,11 @@ class Attention(nn.Module):
 
         self.n_heads: int = args.n_heads
         self.n_kv_heads: int = args.n_kv_heads
-        
+
         self.repeats = self.n_heads // self.n_kv_heads
         self.sliding_window = self.args.sliding_window
 
-        self.scale = self.args.head_dim**-0.5
+        self.scale = self.args.head_dim ** -0.5
 
         self.wq = nn.Linear(
             args.dim,
@@ -67,12 +67,11 @@ class Attention(nn.Module):
             args.dim,
             bias=False
         )
-        
 
     def forward(
-        self, x: torch.Tensor, 
-        freqs_cis: torch.Tensor,
-        cache: CacheView,
+            self, x: torch.Tensor,
+            freqs_cis: torch.Tensor,
+            cache: CacheView,
     ) -> torch.Tensor:
         seqlen_sum, _ = x.shape
 
@@ -85,7 +84,7 @@ class Attention(nn.Module):
         if cache.prefill:
             key, val = cache.interleave_kv(xk, xv)
             cache.update(xk, xv)
-        else: 
+        else:
             cache.update(xk, xv)
             key, val = cache.key, cache.value
             key = key.view(seqlen_sum * cache.sliding_window, self.n_kv_heads, self.args.head_dim)
@@ -144,14 +143,22 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
+        self.attention = None
+        self.feed_forward = None
+        self.attention_norm = None
+        self.ffn_norm = None
+
+        self.args = args
+
+    def activate(self):
+        args = self.args
         self.attention = Attention(args)
         self.feed_forward = FeedForward(args=args)
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.args = args
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: CacheView
+            self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: CacheView
     ) -> torch.Tensor:
         r = self.attention.forward(self.attention_norm(x), freqs_cis, cache)
         h = x + r
@@ -159,9 +166,19 @@ class TransformerBlock(nn.Module):
         out = h + r
         return out
 
+    def deactivate(self):
+        del self.attention
+        del self.feed_forward
+        del self.attention_norm
+        del self.ffn_norm
+        self.attention = None
+        self.feed_forward = None
+        self.attention_norm = None
+        self.ffn_norm = None
+
 
 class Transformer(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, weights_mmap):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
@@ -169,7 +186,6 @@ class Transformer(nn.Module):
         assert self.vocab_size > 0
 
         self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
-
         self.layers = torch.nn.ModuleList(
             [TransformerBlock(args=args) for _ in range(args.n_layers)]
         )
@@ -182,7 +198,15 @@ class Transformer(nn.Module):
             bias=False
         )
 
+        self.tok_embeddings.load_state_dict({'weight': weights_mmap['tok_embeddings.weight']})
+        self.norm.load_state_dict({'weight': weights_mmap['norm.weight']})
+        self.output.load_state_dict({'weight': weights_mmap['output.weight']})
         self.freqs_cis = precompute_freqs_cis(self.args.head_dim, 128_000).to("cuda")
+        self.weights_mmap = weights_mmap
+        self.tok_embeddings.to('cuda')
+        self.norm.to('cuda')
+        self.output.to('cuda')
+
 
     @property
     def dtype(self) -> torch.dtype:
@@ -191,6 +215,7 @@ class Transformer(nn.Module):
     @property
     def device(self) -> torch.device:
         return self.tok_embeddings.weight.device
+
 
     def forward(
         self,
@@ -204,20 +229,29 @@ class Transformer(nn.Module):
         input_metadata = cache.get_input_metadata(seqlens)
         h = self.tok_embeddings(input_ids)
         freqs_cis = self.freqs_cis[input_metadata.positions]
+        h = h.to("cuda")
 
-        for layer_id, layer in enumerate(self.layers):
-            h = layer(h, freqs_cis, cache.get_view(layer_id, input_metadata))
+        for i, layer in enumerate(self.layers):
+            layer_weights = [f'layers.{i}.attention.wq.weight',
+                             f'layers.{i}.attention.wk.weight',
+                             f'layers.{i}.attention.wv.weight',
+                             f'layers.{i}.attention.wo.weight',
+                             f'layers.{i}.feed_forward.w1.weight',
+                             f'layers.{i}.feed_forward.w2.weight',
+                             f'layers.{i}.feed_forward.w3.weight',
+                             f'layers.{i}.attention_norm.weight',
+                             f'layers.{i}.ffn_norm.weight'
+                             ]
+            weights_dict = itemgetter(*layer_weights)(self.weights_mmap)
+            weights_dict = {layer_weights[j].replace(f"layers.{i}.", ""): val for j, val in enumerate(weights_dict)}
+
+            layer.activate()
+            layer.load_state_dict(weights_dict)
+            layer = layer.to("cuda")
+            h = layer(h, freqs_cis, cache.get_view(i, input_metadata))
+            layer.deactivate()
 
         cache.update_seqlens(seqlens)
 
+        print("One iteration")
         return self.output(self.norm(h)).float()
-
-    @staticmethod
-    def from_folder(folder: Path, max_batch_size: int = 1, device="cuda", dtype=torch.float16) -> "Transformer":
-        with open(folder / 'params.json', 'r') as f:
-            model_args = ModelArgs(**json.loads(f.read()))
-        model_args.max_batch_size = max_batch_size
-        model = Transformer(model_args).to(device=device, dtype=dtype)
-        loaded = torch.load(folder / 'consolidated.00.pth', mmap=True)
-        model.load_state_dict(loaded)
-        return model
